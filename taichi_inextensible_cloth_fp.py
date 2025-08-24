@@ -60,7 +60,6 @@ class InextensibleClothFP:
         self.tmp_vertex = ti.Vector.field(3, dtype=real, shape=self.n)
         self.colors = ti.Vector.field(3, dtype=real, shape=self.n)
 
-        # 为剪切边和弯曲四边形创建 Taichi 字段
         self.max_shear_edges = 2 * (n_u - 1) * (n_v - 1)  # 最大剪切边数
         self.max_bend_quads = (n_u - 1) * (n_v - 1)       # 最大弯曲四边形数
         self.cnt_shear_edges = ti.field(dtype=ti.i32, shape=())
@@ -189,7 +188,46 @@ class InextensibleClothFP:
         q4 = ( (n2 * ( (p3 - p2).dot(e) / n2l )).cross(e) )
 
         return theta, [q1, q2, q3, q4]
+    
+    @ti.func
+    def sin_half_angle(n1, n2, e):
+        dotn = n1.dot(n2)
+        val = ti.sqrt(0.5 * max(0.0, 1.0 - dotn))
+        sign = 1.0
+        if (n1.cross(n2)).dot(e) < 0:
+            sign = -1.0
+        return sign * val
+    
+    @ti.func
+    def bending_forces(p1, p2, p3, p4, k_bend: float):
+        E = p2 - p3
+        e_len = E.norm(1e-8)
 
+        N1 = (p1 - p3).cross(p1 - p2)
+        N2 = (p4 - p2).cross(p4 - p3)
+
+        N1_len = N1.norm(1e-8)
+        N2_len = N2.norm(1e-8)
+        n1 = N1 / N1_len
+        n2 = N2 / N2_len
+
+        u1 = (e_len / (N1_len * N1_len)) * N1
+        u4 = (e_len / (N2_len * N2_len)) * N2
+        u2 = -((p1 - p3).dot(E) / e_len) * (N1 / (N1_len * N1_len)) \
+        - ((p4 - p3).dot(E) / e_len) * (N2 / (N2_len * N2_len))
+        u3 = ((p1 - p2).dot(E) / e_len) * (N1 / (N1_len * N1_len)) \
+        +((p4 - p2).dot(E) / e_len) * (N2 / (N2_len * N2_len))
+
+        coeff = k_bend * e_len * e_len / (N1_len + N2_len)
+        elastic_term = InextensibleClothFP.sin_half_angle(n1, n2, E.normalized(1e-8))
+
+        F1 = coeff * elastic_term * u1
+        F2 = coeff * elastic_term * u2
+        F3 = coeff * elastic_term * u3
+        F4 = coeff * elastic_term * u4
+
+        return F1, F2, F3, F4
+    
     @ti.kernel
     def add_bending_forces(self):
         for bid in range(self.cnt_bend_quads[None]):
@@ -198,13 +236,8 @@ class InextensibleClothFP:
             i2 = self.bend_quad_i2[bid]
             i3 = self.bend_quad_i3[bid]
             p0, p1, p2, p3 = self.x[i0], self.x[i1], self.x[i2], self.x[i3]
-            theta, grads = InextensibleClothFP.bending_angle_and_grad(p0, p1, p2, p3)
-            for idx, vi in ti.static(enumerate([i0, i1, i2, i3])):
-                grad = grads[idx]
-                f = -self.k_bend * theta * grad
-                self.f[vi] += f
-
-
+            self.f[i0], self.f[i1], self.f[i2], self.f[i3] = InextensibleClothFP.bending_forces(p0, p1, p2, p3,self.k_bend)
+    
     @ti.kernel
     def explicit_predict(self, dt: real):
         for i in range(self.n):
@@ -213,6 +246,7 @@ class InextensibleClothFP:
             if self.inv_m[i] > 0:
                 self.v[i] += dt * self.inv_m[i] * self.f[i]
                 self.x[i] += dt * self.v[i]
+
     @ti.kernel
     def compute_constraint_residuals_and_grads(self):
         for c in range(self.cnt_cons[None]):
@@ -222,11 +256,11 @@ class InextensibleClothFP:
             xi = self.x[i]
             xj = self.x[j]
             d = xj - xi
-            Cc = (d.dot(d)) / l0 - l0  # C = ||d||^2 / l0 - l0
+            Cc = (d.dot(d)) / l0 - l0 
             self.C[c] = Cc
-            g = 2.0 * d / l0            # gradient magnitude direction
-            self.g_a[c] = -g            # contribution to vertex i (row c): -g
-            self.g_b[c] = g             # contribution to vertex j (row c): +g
+            g = 2.0 * d / l0            
+            self.g_a[c] = -g            
+            self.g_b[c] = g             
 
     @ti.kernel
     def clear_tmp_vertex(self):
@@ -381,53 +415,72 @@ class InextensibleClothFP:
             self.fast_projection()
             self.update_velocity(self.dt)
 
+import os
+
 # ------------------------------------------------------------
-# Example usage: run a simple headless simulation
+# Example usage: Save simulation as OBJ files
 # ------------------------------------------------------------
+def save_mesh_to_obj(vertices, triangles, filename):
+    with open(filename, 'w') as f:
+        # 写入顶点
+        for v in vertices:
+            f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+        
+        # 写入面片 (OBJ格式索引从1开始)
+        for tri in triangles:
+            f.write(f"f {tri[0]+1} {tri[1]+1} {tri[2]+1}\n")
+
+def create_cloth_mesh_data(sim):
+    vertices = sim.x.to_numpy()
+    triangles = []
+    for v in range(sim.V - 1):
+        for u in range(sim.U - 1):
+            i0 = v * sim.U + u
+            i1 = v * sim.U + (u + 1)
+            i2 = (v + 1) * sim.U + u
+            i3 = (v + 1) * sim.U + (u + 1)
+            triangles.append([i0, i1, i2])
+            triangles.append([i1, i3, i2])
+    return vertices, triangles
+
 if __name__ == "__main__":
     try:
         ti.init(arch=ti.gpu)
     except:
         ti.init(arch=ti.cpu)
 
-    sim = InextensibleClothFP(n_u=30, n_v=30, dx=0.03, dt=1/240,
-                              iters=8, pcg_iters=80, tol=1e-6,
-                              g=(0.0, -9.8, 0.0), mass_per_vertex=0.02)
+    sim = InextensibleClothFP(n_u=30, n_v=30, dx=0.03, dt=1/360,
+                              iters=12, pcg_iters=100, tol=1e-8,
+                              g=(0.0, -4.9, 0.0), mass_per_vertex=0.05,
+                              k_shear=200.0, k_bend=0.5)
 
-    # Optional: simple GUI scatter (Taichi GUI). Comment out if running headless.
-    gui = ti.GUI("Inextensible Cloth - Fast Projection", res=(800, 600))
-
-    # Camera parameters for a crude projection to 2D
-    def to_ndc(x):
-        # Orthographic: xz -> screen, y is height
-        return ti.Vector([0.5 + (x[0] - 0.5) * 1.5, 0.1 + x[1] * 1.0])
-
-    while gui.running:
-        for _ in range(2):  # simulate 2 substeps per frame
-            sim.step()
-        # visualize
-        pos_np = sim.x.to_numpy()
-        col_np = sim.colors.to_numpy()
+    output_dir = "cloth_simulation_output"
+    os.makedirs(output_dir, exist_ok=True)
         
-        # 转换为 2D 屏幕坐标
-        P = np.zeros((sim.n, 2))
-        for i in range(sim.n):
-            p = pos_np[i]
-            P[i] = [0.5 + (p[0] - 0.5) * 1.5, 0.1 + p[1] * 1.0]
-        
-        gui.circles(P, radius=2, color=0x66ccff)
+    max_frames = 500 
+    save_every_n_frames = 2 
+    
+    frame_count = 0
+    saved_count = 0
+    
+    try:
+        while frame_count < max_frames:
 
-        # draw constraints as lines for a wireframe look
-        lines = []
-        for c in range(sim.cnt_cons[None]):
-            i = sim.con_i[c]
-            j = sim.con_j[c]
-            pi = pos_np[i]
-            pj = pos_np[j]
-            a = [0.5 + (pi[0] - 0.5) * 1.5, 0.1 + pi[1] * 1.0]
-            b = [0.5 + (pj[0] - 0.5) * 1.5, 0.1 + pj[1] * 1.0]
-            lines.append((a, b))
-        for a, b in lines:
-            gui.line(a, b, radius=1, color=0x444444)
+            for _ in range(2): 
+                sim.step()
+            
+            if frame_count % save_every_n_frames == 0:
+                vertices, triangles = create_cloth_mesh_data(sim)
+                filename = os.path.join(output_dir, f"frame_{saved_count:04d}.obj")
+                save_mesh_to_obj(vertices, triangles, filename)
+                saved_count += 1
+                
+                if saved_count % 25 == 0:
+                    print(f"🎥 saved {saved_count} frames to {filename}")
 
-        gui.show()
+            frame_count += 1
+                
+    except KeyboardInterrupt:
+        print(f"\n{saved_count} frames saved")
+
+    print(f"Total saved OBJ files: {saved_count}")
