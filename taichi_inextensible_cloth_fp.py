@@ -20,7 +20,8 @@ vec3 = ti.types.vector(3, real)
 class InextensibleClothFP:
     def __init__(self, n_u=30, n_v=30, dx=0.03, dt=1/240, iters=15, pcg_iters=60,
                  tol=1e-3, g=(0.0, -9.8, 0.0), mass_per_vertex=0.02,
-                 k_shear=500.0, k_bend=1.0):
+                 k_shear=500.0, k_bend=1.0,
+                 strain_threshold=0.0):
         self.n_u = n_u
         self.n_v = n_v
         self.n = n_u * n_v
@@ -33,15 +34,13 @@ class InextensibleClothFP:
         self.mass = mass_per_vertex
         self.k_shear = k_shear
         self.k_bend = k_bend
+        self.strain_threshold = strain_threshold 
 
         self.x = ti.Vector.field(3, dtype=real, shape=self.n)
         self.x_prev = ti.Vector.field(3, dtype=real, shape=self.n)
         self.v = ti.Vector.field(3, dtype=real, shape=self.n)
         self.f = ti.Vector.field(3, dtype=real, shape=self.n)
         self.inv_m = ti.field(dtype=real, shape=self.n)
-
-        self.U = n_u
-        self.V = n_v
 
         self.max_cons = (n_u - 1) * n_v + n_u * (n_v - 1)
         self.cnt_cons = ti.field(dtype=ti.i32, shape=())
@@ -51,7 +50,8 @@ class InextensibleClothFP:
 
         self.C = ti.field(dtype=real, shape=self.max_cons)
         self.g_a = ti.Vector.field(3, dtype=real, shape=self.max_cons)
-        self.g_b = ti.Vector.field(3, dtype=real, shape=self.max_cons)
+        self.g_b = ti.Vector.field(3, dtype=real, shape=self.max_cons)        # tensor/stress 模式: 每个 quad 的主应变/应力度量 + 全局最大值
+        self.max_strain = ti.field(dtype=real, shape=())
 
         self.dlambda = ti.field(dtype=real, shape=self.max_cons)
         self.r = ti.field(dtype=real, shape=self.max_cons)
@@ -60,8 +60,8 @@ class InextensibleClothFP:
         self.tmp_vertex = ti.Vector.field(3, dtype=real, shape=self.n)
         self.colors = ti.Vector.field(3, dtype=real, shape=self.n)
 
-        self.max_shear_edges = 2 * (n_u - 1) * (n_v - 1)  # 最大剪切边数
-        self.max_bend_quads = (n_u - 1) * (n_v - 1)       # 最大弯曲四边形数
+        self.max_shear_edges = 2 * (n_u - 1) * (n_v - 1) 
+        self.max_bend_quads = (n_u - 1) * (n_v - 1)
         self.cnt_shear_edges = ti.field(dtype=ti.i32, shape=())
         self.cnt_bend_quads = ti.field(dtype=ti.i32, shape=())
         
@@ -78,27 +78,26 @@ class InextensibleClothFP:
         self._build_topology()
 
     def idx(self, u, v):
-        return v * self.U + u
+        return v * self.n_u + u
 
     @ti.func
     def idx_func(self, u, v):
-        return v * self.U + u
+        return v * self.n_u + u
 
     def _build_topology(self):
         cons = []
         shear_edges = []
-        bend_quads = []
-        
-        for v in range(self.V):
-            for u in range(self.U):
-                i = v * self.U + u
-                if u + 1 < self.U:
-                    j = v * self.U + (u + 1)
+        bend_quads = []   
+        for v in range(self.n_v):
+            for u in range(self.n_u):
+                i = v * self.n_u + u
+                if u + 1 < self.n_u:
+                    j = v * self.n_u + (u + 1)
                     cons.append((i, j, self.dx))
-                if v + 1 < self.V:
-                    j = (v + 1) * self.U + u
+                if v + 1 < self.n_v:
+                    j = (v + 1) * self.n_u + u
                     cons.append((i, j, self.dx))
-                if u + 1 < self.U and v + 1 < self.V:
+                if u + 1 < self.n_u and v + 1 < self.n_v:
                     i0 = self.idx(u, v)
                     i1 = self.idx(u+1, v+1)
                     i2 = self.idx(u+1, v)
@@ -129,16 +128,16 @@ class InextensibleClothFP:
 
     @ti.kernel
     def _init_states(self):
-        for v in range(self.V):
-            for u in range(self.U):
-                i = v * self.U + u
+        for v in range(self.n_v):
+            for u in range(self.n_u):
+                i = v * self.n_u + u
                 self.x[i] = vec3(u * self.dx, 0.5, v * self.dx)
                 self.v[i] = vec3(0.0, 0.0, 0.0)
                 self.inv_m[i] = 1.0 / self.mass
-                self.colors[i] = vec3(0.7 + 0.3 * u / max(1, self.U - 1),
-                                       0.6 + 0.3 * v / max(1, self.V - 1), 0.8)
+                self.colors[i] = vec3(0.7 + 0.3 * u / max(1, self.n_u - 1),
+                                       0.6 + 0.3 * v / max(1, self.n_v - 1), 0.8)
         self.inv_m[self.idx_func(0, 0)] = 0.0
-        self.inv_m[self.idx_func(self.U - 1, 0)] = 0.0
+        self.inv_m[self.idx_func(self.n_u - 1, 0)] = 0.0
 
     # ------------------------------------------------------------
     @ti.kernel
@@ -168,27 +167,6 @@ class InextensibleClothFP:
                 if self.inv_m[j] > 0:
                     self.f[j] -= f
 
-    @ti.func
-    def normalize_safe(v):
-        l = v.norm() + 1e-8
-        return v / l, l
-
-    @ti.func
-    def bending_angle_and_grad(p1, p2, p3, p4):
-        e, _ = InextensibleClothFP.normalize_safe(p2 - p3)
-        n1, n1l = InextensibleClothFP.normalize_safe((p2 - p1).cross(p3 - p1))
-        n2, n2l = InextensibleClothFP.normalize_safe((p3 - p4).cross(p2 - p4))
-        st = n1.cross(n2).dot(e)
-        ct = n1.dot(n2)
-        theta = ti.atan2(st, ct)
-
-        q3 = ( (n1 * ( (p2 - p3).dot(e) / n1l )).cross(e) )
-        q2 = ( (n1 * ( (p3 - p2).dot(e) / n1l )).cross(e) )
-        q1 = -q2 - q3
-        q4 = ( (n2 * ( (p3 - p2).dot(e) / n2l )).cross(e) )
-
-        return theta, [q1, q2, q3, q4]
-    
     @ti.func
     def sin_half_angle(n1, n2, e):
         dotn = n1.dot(n2)
@@ -236,7 +214,11 @@ class InextensibleClothFP:
             i2 = self.bend_quad_i2[bid]
             i3 = self.bend_quad_i3[bid]
             p0, p1, p2, p3 = self.x[i0], self.x[i1], self.x[i2], self.x[i3]
-            self.f[i0], self.f[i1], self.f[i2], self.f[i3] = InextensibleClothFP.bending_forces(p0, p1, p2, p3,self.k_bend)
+            f1, f2, f3, f4 = InextensibleClothFP.bending_forces(p0, p1, p2, p3, self.k_bend)
+            self.f[i0] += f1
+            self.f[i1] += f2
+            self.f[i2] += f3
+            self.f[i3] += f4
     
     @ti.kernel
     def explicit_predict(self, dt: real):
@@ -256,11 +238,42 @@ class InextensibleClothFP:
             xi = self.x[i]
             xj = self.x[j]
             d = xj - xi
-            Cc = (d.dot(d)) / l0 - l0 
+            Cc = (d.dot(d)) / l0 - l0
             self.C[c] = Cc
-            g = 2.0 * d / l0            
-            self.g_a[c] = -g            
-            self.g_b[c] = g             
+            g = 2.0 * d / l0
+            self.g_a[c] = -g
+            self.g_b[c] = g
+
+    @ti.kernel
+    def compute_cell_max_strain(self):
+        maxv = 0.0
+        for q in range(self.max_bend_quads):
+            W = self.n_u - 1
+            u = q % W
+            v = q // W
+            i0 = v * self.n_u + u
+            i1 = v * self.n_u + (u + 1)
+            i2 = (v + 1) * self.n_u + u
+            e_u = self.x[i1] - self.x[i0]
+            e_v = self.x[i2] - self.x[i0]
+            fxu = e_u.x / self.dx
+            fzu = e_u.z / self.dx
+            fxv = e_v.x / self.dx
+            fzv = e_v.z / self.dx
+            C00 = fxu * fxu + fzu * fzu
+            C01 = fxu * fxv + fzu * fzv
+            C11 = fxv * fxv + fzv * fzv
+            E00 = 0.5 * (C00 - 1.0)
+            E01 = 0.5 * C01
+            E11 = 0.5 * (C11 - 1.0)
+            diff = E00 - E11
+            temp = ti.sqrt(diff * diff + 4.0 * E01 * E01)
+            lam1 = 0.5 * (E00 + E11 + temp)
+            lam2 = 0.5 * (E00 + E11 - temp)
+            m = ti.max(ti.abs(lam1), ti.abs(lam2))
+            if m > maxv:
+                maxv = m
+        self.max_strain[None] = maxv
 
     @ti.kernel
     def clear_tmp_vertex(self):
@@ -390,15 +403,17 @@ class InextensibleClothFP:
             rTr = rTr_new
 
     def fast_projection(self):
-        # Outer iterations: re-linearize C and J at current x
         for it in range(self.fp_outer_iters):
             self.compute_constraint_residuals_and_grads()
-            # rhs = C / (dt^2)
             rhs_scale = 1.0 / (self.dt * self.dt)
             self.pcg_solve_for_dlambda(rhs_scale)
-            # Update positions
             self.compute_delta_x_from_dlambda(self.dt)
-            self.apply_ground()
+            # self.apply_ground() 
+            if self.strain_threshold > 0.0 and (it + 1) % 3 == 0:
+                self.compute_cell_max_strain()
+                if self.max_strain[None] < self.strain_threshold:
+                    print(it)
+                    break           
 
     @ti.kernel
     def update_velocity(self, dt: real):
@@ -406,14 +421,14 @@ class InextensibleClothFP:
             self.v[i] = (self.x[i] - self.x_prev[i]) / dt
 
     def step(self):
-            self.clear_force()
-            self.add_gravity()
-            self.add_shear_forces()
-            self.add_bending_forces()
-            self.explicit_predict(self.dt)
-            self.apply_ground()
-            self.fast_projection()
-            self.update_velocity(self.dt)
+        self.clear_force()
+        self.add_gravity()
+        self.add_shear_forces()
+        self.add_bending_forces()
+        self.explicit_predict(self.dt)
+        # self.apply_ground()
+        self.fast_projection()
+        self.update_velocity(self.dt)
 
 import os
 
@@ -422,23 +437,21 @@ import os
 # ------------------------------------------------------------
 def save_mesh_to_obj(vertices, triangles, filename):
     with open(filename, 'w') as f:
-        # 写入顶点
         for v in vertices:
             f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
         
-        # 写入面片 (OBJ格式索引从1开始)
         for tri in triangles:
             f.write(f"f {tri[0]+1} {tri[1]+1} {tri[2]+1}\n")
 
 def create_cloth_mesh_data(sim):
     vertices = sim.x.to_numpy()
     triangles = []
-    for v in range(sim.V - 1):
-        for u in range(sim.U - 1):
-            i0 = v * sim.U + u
-            i1 = v * sim.U + (u + 1)
-            i2 = (v + 1) * sim.U + u
-            i3 = (v + 1) * sim.U + (u + 1)
+    for v in range(sim.n_v - 1):
+        for u in range(sim.n_u - 1):
+            i0 = v * sim.n_u + u
+            i1 = v * sim.n_u + (u + 1)
+            i2 = (v + 1) * sim.n_u + u
+            i3 = (v + 1) * sim.n_u + (u + 1)
             triangles.append([i0, i1, i2])
             triangles.append([i1, i3, i2])
     return vertices, triangles
@@ -450,14 +463,15 @@ if __name__ == "__main__":
         ti.init(arch=ti.cpu)
 
     sim = InextensibleClothFP(n_u=30, n_v=30, dx=0.03, dt=1/360,
-                              iters=12, pcg_iters=100, tol=1e-8,
-                              g=(0.0, -4.9, 0.0), mass_per_vertex=0.05,
-                              k_shear=200.0, k_bend=0.5)
+                              iters=20, pcg_iters=50, tol=1e-6,
+                              g=(0.0, -9.8, 0.0), mass_per_vertex=0.05,
+                              k_shear=500.0, k_bend=0.5,
+                              strain_threshold=-1)
 
     output_dir = "cloth_simulation_output"
     os.makedirs(output_dir, exist_ok=True)
         
-    max_frames = 500 
+    max_frames = 100
     save_every_n_frames = 2 
     
     frame_count = 0
@@ -475,8 +489,8 @@ if __name__ == "__main__":
                 save_mesh_to_obj(vertices, triangles, filename)
                 saved_count += 1
                 
-                if saved_count % 25 == 0:
-                    print(f"🎥 saved {saved_count} frames to {filename}")
+                if saved_count % 5 == 0:
+                    print(f"saved {saved_count} frames to {filename}")
 
             frame_count += 1
                 

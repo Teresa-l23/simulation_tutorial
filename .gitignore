@@ -1,4 +1,5 @@
 .DS_Store
 test
 .vscode
-cloth_simulation_output
+cloth_simulation_output*
+cloth_animation*
